@@ -1,0 +1,74 @@
+# ===================================================================
+# Requirements pour RAG_Laury — Pipeline RAG mono-GPU
+# Machine cible : 2× NVIDIA RTX 6000 Ada (48 GB VRAM chacune)
+# Python 3.12+ / CUDA 12.x
+# ===================================================================
+#
+# INSTALLATION :
+#
+#   pip install -r requirements.txt
+#
+# NOTE : après l'installation, vérifier que onnxruntime-gpu
+#        n'est pas écrasé par onnxruntime (CPU).
+#        Si `python -c "import onnxruntime; print(onnxruntime.get_available_providers())"`
+#        n'affiche pas CUDAExecutionProvider, faire :
+#           pip uninstall onnxruntime -y
+#           pip install onnxruntime-gpu --force-reinstall --no-deps
+#
+# ARCHITECTURE GPU :
+#   GPU 0 → Ollama (LLM + embeddings) + Cross-encoder (reranking) + spaCy + EasyOCR + Docling
+#
+# ===================================================================
+
+# ─────────────── Deep Learning / GPU ───────────────
+# PyTorch avec CUDA 12.1
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch>=2.5.0
+torchvision>=0.20.0
+torchaudio>=2.5.0
+
+# Transformers & sentence-transformers (cross-encoder, reranking)
+transformers>=4.45.0
+sentence-transformers>=5.0.0
+accelerate>=1.0.0
+
+# ONNX Runtime GPU (utilisé par ChromaDB, Docling)
+# IMPORTANT : ne pas installer onnxruntime (CPU) en même temps
+onnxruntime-gpu>=1.24.0
+
+# CuPy — accélération GPU pour spaCy et calculs matriciels
+cupy-cuda12x>=14.0.0
+
+# ─────────────── Embeddings & LLM (Ollama) ───────────────
+requests>=2.31.0
+langchain-core>=0.3.0
+langchain-ollama>=0.3.0
+langchain-community>=0.3.0
+
+# ─────────────── Indexation & Recherche ───────────────
+# ChromaDB (base vectorielle)
+chromadb>=1.0.0
+# BM25 (recherche par mots-clés)
+rank-bm25>=0.2.2
+
+# ─────────────── PDF → Markdown (Docling) ───────────────
+docling>=2.40.0
+docling-core>=2.40.0
+easyocr>=1.7.0
+
+# ─────────────── NLP ───────────────
+# spaCy (GPU activé via CuPy ci-dessus)
+spacy>=3.8.0
+# Chunking Markdown
+semantic-text-splitter>=0.27.0
+
+# ─────────────── Base de données ───────────────
+pymongo>=4.10.0
+
+# ─────────────── Interface Web ───────────────
+streamlit>=1.40.0
+markdown2>=2.5.0
+
+# ─────────────── Utilitaires ───────────────
+joblib>=1.3.0
+pillow>=10.0.0

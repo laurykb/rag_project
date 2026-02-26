@@ -1,0 +1,373 @@
+# core/evaluation.py
+"""
+Pipeline d'évaluation automatique du RAG — inspiré de RAGAS, 100% local (Ollama).
+
+Deux niveaux de métriques :
+────────────────────────────────────────────────────────────────────────────────
+NIVEAU 1 — Heuristiques rapides (sans LLM, instantanées) :
+  • exact_match        : la référence est-elle contenue dans la réponse ?
+  • f1_token           : overlap token SQuAD entre réponse générée et référence
+  • context_recall     : les chunks couvrent-ils les tokens de la référence ?
+  • context_precision  : les topK chunks sont-ils pertinents (F1 > seuil) ?
+
+NIVEAU 2 — LLM-as-a-judge local (Ollama, comme RAGAS) :
+  • faithfulness_llm       : la réponse ne contient-elle que ce qui est dans le contexte ?
+  • answer_relevance_llm   : la réponse répond-elle à la question ?
+  • context_relevance_llm  : les chunks récupérés sont-ils pertinents à la question ?
+
+Stratégie d'évaluation :
+  On évalue les réponses BRUTES du LLM (pas besoin de référence pour les métriques LLM).
+  Les métriques heuristiques nécessitent une réponse de référence.
+  En pratique : pour un corpus Q/R, on a la référence -> on peut tout calculer.
+  Pour un monitoring sans référence, on utilise uniquement les métriques LLM.
+"""
+from __future__ import annotations
+
+import re
+import time
+from typing import Optional
+from pymongo import MongoClient
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers tokenisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower().strip())
+
+def _tokens(text: str) -> set:
+    return set(re.findall(r"\w+", _normalize(text), flags=re.UNICODE))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NIVEAU 1 — Métriques heuristiques (sans LLM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def exact_match(generated: str, reference: str) -> float:
+    return float(_normalize(reference) in _normalize(generated))
+
+
+def f1_token(generated: str, reference: str) -> float:
+    gen_tok = _tokens(generated)
+    ref_tok = _tokens(reference)
+    if not ref_tok or not gen_tok:
+        return 0.0
+    common = gen_tok & ref_tok
+    precision = len(common) / len(gen_tok)
+    recall    = len(common) / len(ref_tok)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def context_recall(chunks: list, reference: str) -> float:
+    if not reference or not chunks:
+        return 0.0
+    ref_tok = _tokens(reference)
+    covered = set()
+    for c in chunks:
+        covered |= _tokens(c.get("doc", ""))
+    if not ref_tok:
+        return 0.0
+    return len(ref_tok & covered) / len(ref_tok)
+
+
+def context_precision(chunks: list, reference: str, topk: int = 5) -> float:
+    if not reference or not chunks:
+        return 0.0
+    relevant = sum(
+        1 for c in chunks[:topk]
+        if f1_token(c.get("doc", ""), reference) > 0.1
+    )
+    return relevant / min(topk, len(chunks))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NIVEAU 2 — LLM-as-a-judge local (Ollama, style RAGAS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_judge_llm(model: str = None):
+    from langchain_community.llms import Ollama
+    from config import REWRITER_MODEL
+    judge_model = model or REWRITER_MODEL
+    return Ollama(model=judge_model, temperature=0.0)
+
+
+def _ask_judge(llm, prompt: str, max_retries: int = 2) -> float:
+    for attempt in range(max_retries + 1):
+        try:
+            raw = llm.invoke(prompt).strip()
+            matches = re.findall(r"\b(0(?:\.\d+)?|1(?:\.0+)?)\b", raw)
+            if matches:
+                return min(1.0, max(0.0, float(matches[0])))
+            m10 = re.search(r"(\d+(?:\.\d+)?)\s*/\s*10", raw)
+            if m10:
+                return min(1.0, float(m10.group(1)) / 10.0)
+        except Exception as e:
+            if attempt == max_retries:
+                print(f"[judge] Échec après {max_retries} tentatives : {e}")
+    return 0.0
+
+
+def faithfulness_llm(generated: str, chunks: list, llm=None) -> float:
+    """La réponse est-elle entièrement fondée sur le contexte ? (0.0 = hallucination, 1.0 = fidèle)"""
+    if not generated or not chunks:
+        return 0.0
+    context = "\n\n".join(c.get("doc", "")[:500] for c in chunks[:5])
+    prompt = f"""Tu es un évaluateur expert en RAG (Retrieval-Augmented Generation).
+
+CONTEXTE (chunks récupérés) :
+{context}
+
+RÉPONSE GÉNÉRÉE :
+{generated[:1000]}
+
+TÂCHE : Évalue la fidélité (faithfulness) de la réponse.
+La réponse est-elle entièrement fondée sur le contexte fourni, sans information inventée ?
+
+Règles de notation :
+- 1.0 : Toutes les affirmations de la réponse sont directement justifiables par le contexte.
+- 0.5 : Certaines affirmations sont dans le contexte, d'autres sont extrapolées ou ambiguës.
+- 0.0 : La réponse contient des informations absentes ou contredisant le contexte (hallucination).
+
+Réponds UNIQUEMENT avec un nombre décimal entre 0.0 et 1.0. Exemple : 0.8
+Score :"""
+    if llm is None:
+        llm = _get_judge_llm()
+    return _ask_judge(llm, prompt)
+
+
+def answer_relevance_llm(generated: str, question: str, llm=None) -> float:
+    """La réponse répond-elle bien à la question ? (0.0 = hors sujet, 1.0 = direct et complet)"""
+    if not generated or not question:
+        return 0.0
+    prompt = f"""Tu es un évaluateur expert en RAG.
+
+QUESTION : {question}
+
+RÉPONSE : {generated[:1000]}
+
+TÂCHE : Évalue la pertinence de la réponse par rapport à la question.
+
+Règles de notation :
+- 1.0 : La réponse répond directement et complètement à la question.
+- 0.5 : La réponse répond partiellement ou contient des informations non demandées.
+- 0.0 : La réponse ne répond pas à la question, est hors sujet, ou dit juste "je ne sais pas".
+
+Réponds UNIQUEMENT avec un nombre décimal entre 0.0 et 1.0. Exemple : 0.7
+Score :"""
+    if llm is None:
+        llm = _get_judge_llm()
+    return _ask_judge(llm, prompt)
+
+
+def context_relevance_llm(chunks: list, question: str, llm=None) -> float:
+    """Les chunks récupérés sont-ils pertinents à la question ? (évalue la qualité du retrieval)"""
+    if not chunks or not question:
+        return 0.0
+    snippets = "\n---\n".join(c.get("doc", "")[:300] for c in chunks[:5])
+    prompt = f"""Tu es un évaluateur expert en RAG.
+
+QUESTION : {question}
+
+CONTEXTE RÉCUPÉRÉ (extraits) :
+{snippets}
+
+TÂCHE : Évalue la pertinence du contexte récupéré par rapport à la question.
+
+Règles de notation :
+- 1.0 : Tous les passages récupérés sont directement utiles pour répondre à la question.
+- 0.5 : Certains passages sont pertinents, d'autres sont du bruit.
+- 0.0 : Aucun passage n'est utile pour répondre à la question.
+
+Réponds UNIQUEMENT avec un nombre décimal entre 0.0 et 1.0. Exemple : 0.6
+Score :"""
+    if llm is None:
+        llm = _get_judge_llm()
+    return _ask_judge(llm, prompt)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Évaluation d'une seule paire
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_single(
+    question: str,
+    generated_answer: str,
+    retrieved_chunks: list,
+    reference_answer: str = "",
+    use_llm_judge: bool = True,
+    llm_judge=None,
+    topk_precision: int = 5,
+) -> dict:
+    """
+    Calcule toutes les métriques pour une paire (question, réponse générée).
+    - reference_answer optionnel : active les métriques heuristiques si fourni.
+    - use_llm_judge : active les métriques LLM-as-a-judge (faithfulness, relevance...).
+    """
+    has_ref = bool(reference_answer and reference_answer.strip())
+
+    metrics = {
+        "question": question,
+        "reference": reference_answer,
+        "generated": generated_answer,
+        "num_chunks_retrieved": len(retrieved_chunks),
+    }
+
+    # Métriques heuristiques (nécessitent la référence)
+    if has_ref:
+        metrics["exact_match"]       = exact_match(generated_answer, reference_answer)
+        metrics["f1_token"]          = f1_token(generated_answer, reference_answer)
+        metrics["context_recall"]    = context_recall(retrieved_chunks, reference_answer)
+        metrics["context_precision"] = context_precision(retrieved_chunks, reference_answer, topk=topk_precision)
+    else:
+        metrics["exact_match"]       = None
+        metrics["f1_token"]          = None
+        metrics["context_recall"]    = None
+        metrics["context_precision"] = None
+
+    # Métriques LLM-as-a-judge (ne nécessitent PAS de référence)
+    if use_llm_judge:
+        judge = llm_judge or _get_judge_llm()
+        metrics["faithfulness"]      = faithfulness_llm(generated_answer, retrieved_chunks, llm=judge)
+        metrics["answer_relevance"]  = answer_relevance_llm(generated_answer, question, llm=judge)
+        metrics["context_relevance"] = context_relevance_llm(retrieved_chunks, question, llm=judge)
+    else:
+        metrics["faithfulness"]      = None
+        metrics["answer_relevance"]  = None
+        metrics["context_relevance"] = None
+
+    return metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Pipeline d'évaluation batch
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_evaluation_batch(
+    qa_pairs: list,
+    source_filter: str = None,
+    system_prompt: str = None,
+    use_llm_judge: bool = True,
+    progress_callback=None,
+) -> list:
+    """
+    Lance l'évaluation sur une liste de paires Q/R.
+    qa_pairs : liste de dicts {"question": ..., "answer": ...}
+    progress_callback(i, n, question) : appelé à chaque étape.
+    """
+    from core.ask import process_query
+
+    results = []
+    n = len(qa_pairs)
+    # Instancier le juge UNE seule fois pour tout le batch
+    judge = _get_judge_llm() if use_llm_judge else None
+
+    for i, pair in enumerate(qa_pairs):
+        question  = pair.get("question", "").strip()
+        reference = pair.get("answer", pair.get("reference", "")).strip()
+
+        if not question:
+            continue
+
+        if progress_callback:
+            progress_callback(i, n, question)
+
+        t0 = time.time()
+        try:
+            generated, chunks, _ = process_query(
+                question,
+                system_prompt=system_prompt,
+                source_filter=source_filter,
+            )
+            latency = time.time() - t0
+            metrics = evaluate_single(
+                question=question,
+                generated_answer=generated or "",
+                retrieved_chunks=chunks or [],
+                reference_answer=reference,
+                use_llm_judge=use_llm_judge,
+                llm_judge=judge,
+            )
+            metrics["latency_s"] = round(latency, 2)
+            metrics["status"]    = "ok"
+        except Exception as e:
+            metrics = {
+                "question": question,
+                "reference": reference,
+                "generated": "",
+                "exact_match": None,
+                "f1_token": None,
+                "context_recall": None,
+                "context_precision": None,
+                "faithfulness": None,
+                "answer_relevance": None,
+                "context_relevance": None,
+                "num_chunks_retrieved": 0,
+                "latency_s": round(time.time() - t0, 2),
+                "status": f"error: {e}",
+            }
+
+        results.append(metrics)
+
+    return results
+
+
+def aggregate_metrics(results: list) -> dict:
+    """Calcule les moyennes de toutes les métriques numériques (ignore les None)."""
+    keys = [
+        "exact_match", "f1_token", "context_recall", "context_precision",
+        "faithfulness", "answer_relevance", "context_relevance",
+        "latency_s", "num_chunks_retrieved",
+    ]
+    ok = [r for r in results if r.get("status") == "ok"]
+    if not ok:
+        return {k: None for k in keys}
+    agg = {}
+    for k in keys:
+        vals = [r[k] for r in ok if r.get(k) is not None]
+        agg[k] = round(sum(vals) / len(vals), 4) if vals else None
+    return agg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MongoDB persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_eval_run_to_mongo(results: list, run_name: str,
+                           db_name: str = "ragdb",
+                           collection_name: str = "eval_runs") -> str:
+    client = MongoClient("mongodb://localhost:27017")
+    col = client[db_name][collection_name]
+    doc = {
+        "run_name": run_name,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "aggregate": aggregate_metrics(results),
+        "details": results,
+        "num_questions": len(results),
+    }
+    inserted = col.insert_one(doc)
+    return str(inserted.inserted_id)
+
+
+def load_eval_runs_from_mongo(db_name: str = "ragdb",
+                               collection_name: str = "eval_runs") -> list:
+    client = MongoClient("mongodb://localhost:27017")
+    col = client[db_name][collection_name]
+    runs = []
+    for r in col.find({}, {"details": 0}):
+        r["_id"] = str(r["_id"])
+        runs.append(r)
+    return sorted(runs, key=lambda x: x.get("timestamp", ""), reverse=True)
+
+
+def load_eval_run_details(run_id: str, db_name: str = "ragdb",
+                           collection_name: str = "eval_runs") -> Optional[dict]:
+    from bson import ObjectId
+    client = MongoClient("mongodb://localhost:27017")
+    col = client[db_name][collection_name]
+    r = col.find_one({"_id": ObjectId(run_id)})
+    if r:
+        r["_id"] = str(r["_id"])
+    return r
