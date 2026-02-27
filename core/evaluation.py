@@ -111,19 +111,19 @@ def _ask_judge(llm, prompt: str, max_retries: int = 2) -> float:
 
 
 def faithfulness_llm(generated: str, chunks: list, llm=None) -> float:
-    """La réponse est-elle entièrement fondée sur le contexte ? (0.0 = hallucination, 1.0 = fidèle)"""
+    """Fidélité : la réponse est-elle entièrement fondée sur le contexte ? (0.0 = hallucination, 1.0 = fidèle)"""
     if not generated or not chunks:
         return 0.0
     context = "\n\n".join(c.get("doc", "")[:500] for c in chunks[:5])
-    prompt = f"""Tu es un évaluateur expert en RAG (Retrieval-Augmented Generation).
+    prompt = f"""Tu es un évaluateur expert en RAG (Génération Augmentée par Récupération).
 
-CONTEXTE (chunks récupérés) :
+CONTEXTE (passages récupérés) :
 {context}
 
 RÉPONSE GÉNÉRÉE :
 {generated[:1000]}
 
-TÂCHE : Évalue la fidélité (faithfulness) de la réponse.
+TÂCHE : Évalue la **fidélité** de la réponse.
 La réponse est-elle entièrement fondée sur le contexte fourni, sans information inventée ?
 
 Règles de notation :
@@ -132,14 +132,14 @@ Règles de notation :
 - 0.0 : La réponse contient des informations absentes ou contredisant le contexte (hallucination).
 
 Réponds UNIQUEMENT avec un nombre décimal entre 0.0 et 1.0. Exemple : 0.8
-Score :"""
+Score de fidélité :"""
     if llm is None:
         llm = _get_judge_llm()
     return _ask_judge(llm, prompt)
 
 
 def answer_relevance_llm(generated: str, question: str, llm=None) -> float:
-    """La réponse répond-elle bien à la question ? (0.0 = hors sujet, 1.0 = direct et complet)"""
+    """Pertinence de la réponse : répond-elle bien à la question ? (0.0 = hors sujet, 1.0 = direct et complet)"""
     if not generated or not question:
         return 0.0
     prompt = f"""Tu es un évaluateur expert en RAG.
@@ -148,22 +148,22 @@ QUESTION : {question}
 
 RÉPONSE : {generated[:1000]}
 
-TÂCHE : Évalue la pertinence de la réponse par rapport à la question.
+TÂCHE : Évalue la **pertinence de la réponse** par rapport à la question posée.
 
 Règles de notation :
 - 1.0 : La réponse répond directement et complètement à la question.
 - 0.5 : La réponse répond partiellement ou contient des informations non demandées.
-- 0.0 : La réponse ne répond pas à la question, est hors sujet, ou dit juste "je ne sais pas".
+- 0.0 : La réponse ne répond pas à la question, est hors sujet, ou dit uniquement "je ne sais pas".
 
 Réponds UNIQUEMENT avec un nombre décimal entre 0.0 et 1.0. Exemple : 0.7
-Score :"""
+Score de pertinence de la réponse :"""
     if llm is None:
         llm = _get_judge_llm()
     return _ask_judge(llm, prompt)
 
 
 def context_relevance_llm(chunks: list, question: str, llm=None) -> float:
-    """Les chunks récupérés sont-ils pertinents à la question ? (évalue la qualité du retrieval)"""
+    """Pertinence du contexte : les passages récupérés sont-ils utiles pour répondre à la question ?"""
     if not chunks or not question:
         return 0.0
     snippets = "\n---\n".join(c.get("doc", "")[:300] for c in chunks[:5])
@@ -171,26 +171,49 @@ def context_relevance_llm(chunks: list, question: str, llm=None) -> float:
 
 QUESTION : {question}
 
-CONTEXTE RÉCUPÉRÉ (extraits) :
+PASSAGES RÉCUPÉRÉS :
 {snippets}
 
-TÂCHE : Évalue la pertinence du contexte récupéré par rapport à la question.
+TÂCHE : Évalue la **pertinence des passages récupérés** par rapport à la question.
+Ces passages contiennent-ils les informations nécessaires pour répondre à la question ?
 
 Règles de notation :
 - 1.0 : Tous les passages récupérés sont directement utiles pour répondre à la question.
-- 0.5 : Certains passages sont pertinents, d'autres sont du bruit.
+- 0.5 : Certains passages sont pertinents, d'autres sont du bruit ou hors sujet.
 - 0.0 : Aucun passage n'est utile pour répondre à la question.
 
 Réponds UNIQUEMENT avec un nombre décimal entre 0.0 et 1.0. Exemple : 0.6
-Score :"""
+Score de pertinence du contexte :"""
     if llm is None:
         llm = _get_judge_llm()
     return _ask_judge(llm, prompt)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Évaluation d'une seule paire
+#  Correspondance clé → label français (pour l'affichage UI)
 # ─────────────────────────────────────────────────────────────────────────────
+
+METRIC_LABELS_FR = {
+    "faithfulness":       "Fidélité (réponse ↔ contexte)",
+    "answer_relevance":   "Pertinence de la réponse",
+    "context_relevance":  "Pertinence du contexte récupéré",
+    "exact_match":        "Correspondance exacte",
+    "f1_token":           "Score F1 (tokens)",
+    "context_recall":     "Rappel du contexte",
+    "context_precision":  "Précision du contexte",
+    "latency_s":          "Latence (secondes)",
+    "num_chunks_retrieved": "Passages récupérés",
+}
+
+METRIC_DESCRIPTIONS_FR = {
+    "faithfulness":      "La réponse ne contient que des informations présentes dans le contexte (0 = hallucination, 1 = fidèle).",
+    "answer_relevance":  "La réponse répond directement à la question posée (0 = hors sujet, 1 = complet).",
+    "context_relevance": "Les passages récupérés sont utiles pour répondre à la question (0 = bruit, 1 = pertinent).",
+    "exact_match":       "La réponse de référence est contenue mot pour mot dans la réponse générée.",
+    "f1_token":          "Overlap de tokens entre réponse générée et référence (style SQuAD).",
+    "context_recall":    "Les tokens de la référence sont-ils couverts par le contexte récupéré ?",
+    "context_precision": "Quelle fraction des passages récupérés est pertinente à la référence ?",
+}
 
 def evaluate_single(
     question: str,

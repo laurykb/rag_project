@@ -736,7 +736,7 @@ with tab1:
             disabled=st.session_state.is_generating,
             help=(
                 "Active : apres generation, le LLM evalue automatiquement sa reponse "
-                "(Faithfulness, Answer Relevance, Context Relevance).\n\n"
+                "(Fidélité, Pertinence réponse, Pertinence contexte).\n\n"
                 "Si le score est insuffisant, le pipeline reformule la question et retente "
                 "le retrieval+generation (max 1 retry par defaut).\n\n"
                 "Desactive : pipeline classique, pas d'evaluation automatique.\n\n"
@@ -1010,23 +1010,23 @@ with tab1:
         # Affichage du résultat d'évaluation
         if st.session_state.eval_result:
             ev = st.session_state.eval_result
-            st.markdown("#### Evaluation results *(LLM-as-judge, scored 0 → 1)*")
+            st.markdown("#### Évaluation automatique *(LLM-as-judge, score 0 → 1)*")
 
             METRIC_INFO = {
-                "Faithfulness": (
+                "Fidélité": (
                     ev.get("faithfulness"),
-                    "Does the answer contain only facts supported by the retrieved context? "
-                    "Low score = hallucination risk.",
+                    "La réponse ne contient-elle que des faits issus du contexte récupéré ? "
+                    "Score faible = risque d'hallucination.",
                 ),
-                "Answer Relevance": (
+                "Pertinence réponse": (
                     ev.get("answer_relevance"),
-                    "How well does the answer address the question asked? "
-                    "Low score = off-topic or incomplete response.",
+                    "La réponse répond-elle bien à la question posée ? "
+                    "Score faible = réponse hors sujet ou incomplète.",
                 ),
-                "Context Relevance": (
+                "Pertinence contexte": (
                     ev.get("context_relevance"),
-                    "How relevant are the retrieved chunks to the question? "
-                    "Low score = retrieval is pulling irrelevant passages.",
+                    "Les passages récupérés sont-ils utiles pour répondre à la question ? "
+                    "Score faible = le retrieval remonte des passages non pertinents.",
                 ),
             }
 
@@ -1038,9 +1038,9 @@ with tab1:
                         st.metric(name, f"{val:.2f}")
                         st.caption(desc)
 
-            st.caption(f"Chunks evaluated: {ev.get('num_chunks_retrieved', 0)}")
+            st.caption(f"Passages évalués : {ev.get('num_chunks_retrieved', 0)}")
 
-            if st.button("Close evaluation", key="btn_close_eval"):
+            if st.button("Fermer l'évaluation", key="btn_close_eval"):
                 st.session_state.eval_result = None
                 st.rerun()
 
@@ -2051,7 +2051,7 @@ with tab5:
         min_value=0.1, max_value=0.9,
         value=float(st.session_state.self_rag_threshold),
         step=0.05,
-        help="Score moyen pondéré (Faithfulness×0.45 + Answer Relevance×0.25 + Context Relevance×0.30). "
+        help="Score moyen pondéré (Fidélité×0.45 + Pertinence réponse×0.25 + Pertinence contexte×0.30). "
              "En dessous de ce seuil, le pipeline retente. Recommandé : 0.55.",
     )
     new_self_rag_retries = st.number_input(
