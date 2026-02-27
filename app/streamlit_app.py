@@ -10,7 +10,7 @@ import streamlit as st
 from pymongo import MongoClient
 import re
 from indexing.store_mongo import save_query_to_mongo
-from core.ask import process_query, process_query_stream
+from core.ask import process_query, process_query_stream, get_docs_with_graph
 from core.llm_answer import get_system_prompt, DEFAULT_SYSTEM_PROMPT
 from core.chat_sessions import (
     create_session, get_session, list_sessions,
@@ -621,6 +621,12 @@ if "parent_child_enabled" not in st.session_state:
 if "rewrite_enabled" not in st.session_state:
     st.session_state.rewrite_enabled = False  # désactivé par défaut (latence ~3-5s)
 
+# GraphRAG — activé uniquement si le doc actif possède un graphe
+if "graph_rag_widget" not in st.session_state:
+    st.session_state.graph_rag_widget = True  # valeur brute du checkbox utilisateur
+if "graph_rag_available" not in st.session_state:
+    st.session_state.graph_rag_available = True  # mis à jour par col_chat à chaque rerun
+
 # Modèles actifs (Settings)
 from config import NUM_CHUNKS, EMBED_MODEL, GEN_MODEL
 if "num_chunks" not in st.session_state:
@@ -775,6 +781,23 @@ with tab1:
             ),
         )
 
+        # GraphRAG — désactivé automatiquement si doc sans graphe
+        # _graph_available est calculé dans col_chat après la sélection du doc ;
+        # on lit simplement le session_state qui est mis à jour au même rerun.
+        _col_graph_available = st.session_state.get("graph_rag_available", True)
+        st.checkbox(
+            "GraphRAG (graphe d'entités)",
+            key="graph_rag_widget",
+            disabled=st.session_state.is_generating or not _col_graph_available,
+            help=(
+                "Active : enrichit le retrieval via le graphe d'entités nommées "
+                "du document (relations sémantiques entre entités).\n\n"
+                "🟢 Disponible uniquement si le document actif a été ingéré avec "
+                "l'option GraphRAG activée.\n\n"
+                "🔴 Automatiquement désactivé si le document n'a pas de graphe."
+            ),
+        )
+
         # ── Modèle LLM en VRAM ─────────────────────────────────────────
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown(
@@ -874,23 +897,73 @@ with tab1:
 
         # Sélecteur de document
         sources_chat = col.distinct("source")
+        _docs_with_graph = get_docs_with_graph()
+
         if sources_chat:
+            # Construire les labels avec badge graphe
+            def _doc_label(src):
+                has_graph = any(
+                    src.replace(".pdf", "").replace(".md", "") in g or g in src
+                    for g in _docs_with_graph
+                )
+                return f"{src} 🕸" if has_graph else src
+
+            _options_chat = ["Tous les documents"] + sources_chat
+            _labels_chat  = ["Tous les documents"] + [_doc_label(s) for s in sources_chat]
+
             selected_source_label_chat = st.selectbox(
-                "Document :",
-                ["Tous les documents"] + sources_chat,
+                "Document actif :",
+                _options_chat,
+                format_func=lambda x: _labels_chat[_options_chat.index(x)],
                 key="chat_source_select",
-                help="Restreint la recherche au document selectionne.",
+                help=(
+                    "Restreint la recherche au document sélectionné.\n\n"
+                    "🕸 = graphe d'entités disponible (GraphRAG actif)\n"
+                    "Sans 🕸 = GraphRAG automatiquement désactivé pour ce document."
+                ),
             )
-            st.session_state.chat_sources_filter = (
+            _selected_src = (
                 None if selected_source_label_chat == "Tous les documents"
                 else selected_source_label_chat
             )
-            with st.expander("Documents disponibles", expanded=False):
-                for src in sources_chat:
-                    n_chunks = col.count_documents({"source": src})
-                    st.write(f"**{src}** — {n_chunks} chunks")
+            st.session_state.chat_sources_filter = _selected_src
+
+            # ── Auto-détection GraphRAG (Option C) ──────────────────────────
+            if _selected_src is None:
+                # "Tous les documents" → GraphRAG si au moins 1 graphe existe
+                _graph_available = len(_docs_with_graph) > 0
+            else:
+                _graph_available = any(
+                    _selected_src.replace(".pdf", "").replace(".md", "") in g or g in _selected_src
+                    for g in _docs_with_graph
+                )
+
+            # Stocker la disponibilité pour le checkbox dans col_sessions
+            st.session_state.graph_rag_available = _graph_available
+
+            # Badge statut doc actif
+            if _selected_src:
+                _graph_icon = "🕸 Graphe disponible" if _graph_available else "⚠️ Pas de graphe"
+                _graph_color = "#4ade80" if _graph_available else "#f59e0b"
+                st.markdown(
+                    f"<div style='font-size:11px;color:{_graph_color};"
+                    f"margin:-8px 0 8px 0;'>{_graph_icon} · "
+                    f"<span style='color:#9090b0'>{col.count_documents({'source': _selected_src})} chunks indexés</span></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                _n_total = col.count_documents({})
+                _g_icon  = f"🕸 {len(_docs_with_graph)} graphe(s)" if _docs_with_graph else "⚠️ Aucun graphe"
+                _g_color = "#4ade80" if _docs_with_graph else "#f59e0b"
+                st.markdown(
+                    f"<div style='font-size:11px;color:{_g_color};margin:-8px 0 8px 0;'>"
+                    f"{_g_icon} · <span style='color:#9090b0'>{_n_total} chunks au total ({len(sources_chat)} docs)</span></div>",
+                    unsafe_allow_html=True,
+                )
         else:
             st.session_state.chat_sources_filter = None
+            _graph_available = False
+            st.session_state.graph_rag_available = False
             st.info("Aucun document ingere. Allez dans l'onglet Pipeline RAG.")
 
         # Session active : créer si besoin
@@ -1065,9 +1138,15 @@ with tab1:
 
             # Snapshot IMMÉDIAT de toutes les options pipeline au moment de l'envoi.
             # Ces valeurs sont figées pour toute la durée du traitement.
+            # graph_rag_enabled = checkbox utilisateur ET graphe disponible pour ce doc
+            _graph_rag_enabled = (
+                st.session_state.get("graph_rag_widget", True)
+                and st.session_state.get("graph_rag_available", True)
+            )
             _snapshot = {
                 "parent_child_on":  st.session_state.get("parent_child_enabled", False),
                 "rewrite_enabled":  st.session_state.get("rewrite_enabled", False),
+                "graph_rag_enabled": _graph_rag_enabled,
                 "system_prompt":    st.session_state.system_prompt,
                 "source_filter":    selected_source_filter,
             }
@@ -1101,6 +1180,7 @@ with tab1:
                         conversation_history=history_for_llm,
                         parent_child_on=_snapshot["parent_child_on"],
                         rewrite_enabled=_snapshot["rewrite_enabled"],
+                        graph_rag_enabled=_snapshot["graph_rag_enabled"],
                     )
                     st.session_state.final_chunks = final_chunks or []
                     st.session_state.citations    = citations or []

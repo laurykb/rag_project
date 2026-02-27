@@ -54,6 +54,21 @@ def _get_vocab():
 # ---------- Cache graphe (par source_doc) ----------
 _entity_graph_cache: dict = {}  # source_doc -> graphe (ou False si indisponible)
 
+
+def get_docs_with_graph() -> list[str]:
+    """
+    Retourne la liste des source_doc qui ont un graphe d'entités dans MongoDB.
+    Utilisé par le Streamlit pour distinguer les docs compatibles GraphRAG.
+    """
+    try:
+        from pymongo import MongoClient
+        client = MongoClient("mongodb://localhost:27017")
+        db = client["ragdb"]
+        return db["entity_graph"].distinct("source_doc")
+    except Exception:
+        return []
+
+
 def _load_entity_graph(source_doc: str = None):
     """
     Charge le graphe d'entités depuis MongoDB.
@@ -233,11 +248,13 @@ def process_query(user_q: str, selected_chunks=None, system_prompt=None, source_
 def _prepare_retrieval(user_q: str, source_filter: str = None,
                        conversation_history: list = None,
                        parent_child_on: bool = None,
-                       rewrite_enabled: bool = True):
+                       rewrite_enabled: bool = True,
+                       graph_rag_enabled: bool = True):
     """
     Étapes communes de retrieval (rewrite + hybrid_retrieve).
     Gère la condensation standalone pour les questions de suivi.
     Retourne (q_main, final_chunks).
+    graph_rag_enabled : si False, GraphRAG est court-circuité (doc sans graphe ou option désactivée).
     """
     vocab, acronyms = _get_vocab()
 
@@ -264,7 +281,14 @@ def _prepare_retrieval(user_q: str, source_filter: str = None,
         bm25_tuple = load_bm25_cache(_bm25_path)
 
     # Charger le graphe d'entités filtré par document source
-    entity_graph = _load_entity_graph(source_doc=source_filter)
+    # Court-circuit si graph_rag_enabled=False (doc sans graphe ou option désactivée)
+    if graph_rag_enabled:
+        entity_graph = _load_entity_graph(source_doc=source_filter)
+        if entity_graph is None:
+            print("[graph] Aucun graphe disponible pour ce document → GraphRAG désactivé")
+    else:
+        entity_graph = None
+        print("[graph] GraphRAG désactivé par l'utilisateur")
 
     # Quand Parent-Child est actif, on réduit le topk pour éviter un contexte trop long
     # (chaque chunk enfant → ~4000 chars de contexte parent → 8 chunks → ~32K total)
@@ -299,7 +323,8 @@ def _prepare_retrieval(user_q: str, source_filter: str = None,
 def process_query_stream(user_q: str, system_prompt=None, source_filter: str = None,
                          conversation_history: list = None,
                          parent_child_on: bool = None,
-                         rewrite_enabled: bool = True):
+                         rewrite_enabled: bool = True,
+                         graph_rag_enabled: bool = True):
     """
     Version streaming de process_query() avec mémoire conversationnelle.
     Si SELF_RAG_ENABLED, évalue et retente en non-streaming avant de streamer la meilleure réponse.
@@ -338,6 +363,7 @@ def process_query_stream(user_q: str, system_prompt=None, source_filter: str = N
         conversation_history=conversation_history,
         parent_child_on=parent_child_on,
         rewrite_enabled=rewrite_enabled,
+        graph_rag_enabled=graph_rag_enabled,
     )
 
     # _prepare_retrieval retourne (q_main, chunks) ou (q_main, [], max_ce_score) si hors-scope
