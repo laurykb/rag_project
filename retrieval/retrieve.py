@@ -9,11 +9,16 @@ from retrieval.cross_encoder import rerank_cross_encoder
 from retrieval.graph_retrieve import graph_retrieve_to_lookup
 from retrieval.parent_child import expand_to_parent
 from utils.debug_utils import print_simple_results
-from config import USE_CROSS_ENCODER, CROSS_ENCODER_LOCAL_PATH, CE_DEVICE, NUM_CHUNKS, RRF_K, WEIGHT_SEMANTIC, WEIGHT_BM25, PARENT_CHILD_ENABLED
+from config import USE_CROSS_ENCODER, CROSS_ENCODER_LOCAL_PATH, CE_DEVICE, NUM_CHUNKS, RRF_K, WEIGHT_SEMANTIC, WEIGHT_BM25, PARENT_CHILD_ENABLED, CE_RELEVANCE_THRESHOLD
 
 # Recherche hybride : semantic + BM25 + GraphRAG + fusion RRF + rerank Cross-Encoder
 
 def hybrid_retrieve(collection, query, bm25_tuple, topk_chunks=NUM_CHUNKS, rrf_k=RRF_K, rerank_on=True, debug=True, weight_semantic=WEIGHT_SEMANTIC, weight_bm25=WEIGHT_BM25, entity_graph=None, source_filter: str = None, parent_child_on: bool = None):
+    """
+    Retourne (fused_chunks, max_ce_score).
+    max_ce_score : score CE maximum observé sur tous les chunks après rerank.
+                   None si le cross-encoder n'a pas tourné (USE_CROSS_ENCODER=False).
+    """
     _t_start = time.perf_counter()
 
     # ── Étapes 1, 2, 3 lancées EN PARALLÈLE (elles sont totalement indépendantes) ──
@@ -70,7 +75,7 @@ def hybrid_retrieve(collection, query, bm25_tuple, topk_chunks=NUM_CHUNKS, rrf_k
             print("[graph_retrieve] Aucun chunk trouvé via le graphe")
 
     if not sem_ids and not bm_ids and not graph_ids:
-        return []
+        return [], None
 
     # 4) Fusion RRF — le graphe est fusionné comme source supplémentaire côté sémantique
     #    (les chunks graph sont des "bonus" qui enrichissent le pool sémantique)
@@ -86,11 +91,16 @@ def hybrid_retrieve(collection, query, bm25_tuple, topk_chunks=NUM_CHUNKS, rrf_k
     if debug:
         print_simple_results("Fusion RRF", fused, max_items=topk_chunks)
     # 5) Rerank Cross-Encoder
+    max_ce_score = None
     if rerank_on and USE_CROSS_ENCODER and fused:
         _t_before_ce = time.perf_counter()
         fused = rerank_cross_encoder(query, fused, model_path=CROSS_ENCODER_LOCAL_PATH, device=CE_DEVICE)
         _t_after_ce = time.perf_counter()
         print(f"[⏱ retrieval] cross-encoder rerank : {(_t_after_ce - _t_before_ce)*1000:.0f}ms")
+        # Score CE max observé → utilisé pour la détection hors-scope
+        if fused:
+            max_ce_score = max(it.get("ce_score", 0.0) for it in fused)
+            print(f"[scope] max CE score : {max_ce_score:.3f} (seuil={CE_RELEVANCE_THRESHOLD})")
         if debug:
             print_simple_results("Classement final", fused, max_items=topk_chunks)
 
@@ -105,4 +115,4 @@ def hybrid_retrieve(collection, query, bm25_tuple, topk_chunks=NUM_CHUNKS, rrf_k
 
     _t_end = time.perf_counter()
     print(f"[⏱ retrieval] TOTAL pipeline retrieval : {(_t_end - _t_start)*1000:.0f}ms → {len(fused)} chunks")
-    return fused
+    return fused, max_ce_score

@@ -6,7 +6,6 @@ Système de citations [1], [2]... pour la traçabilité des sources.
 """
 from config import NUM_CHUNKS, MAX_CHUNK_LENGTH
 from langchain_community.llms import Ollama
-from langchain_core.prompts import PromptTemplate
 from config import GEN_MODEL, LLM_NUM_CTX
 import os
 
@@ -208,22 +207,11 @@ def answer(question: str, chunks: list[dict], gpu_ids="0", system_prompt=None,
     )
 
     history_section = f"\n\n{history_block}\n" if history_block else ""
-    template = system_prompt + history_section + """
+    final_prompt = (system_prompt + history_section +
+                    "\n\nCONTEXTE :\n" + context +
+                    "\n\nQuestion :\n" + question +
+                    "\n\nRéponse :")
 
-CONTEXTE :
-{context}
-
-Question :
-{question}
-
-Réponse :"""
-
-    prompt_fr = PromptTemplate(
-        input_variables=["context", "question"],
-        template=template.strip()
-    )
-
-    final_prompt = prompt_fr.format(context=context, question=question)
     response = llm.invoke(final_prompt)
     return response, citations
 
@@ -255,22 +243,12 @@ def answer_stream(question: str, chunks: list[dict], gpu_ids="0", system_prompt=
     )
 
     history_section = f"\n\n{history_block}\n" if history_block else ""
-    template = system_prompt + history_section + """
 
-CONTEXTE :
-{context}
-
-Question :
-{question}
-
-Réponse :"""
-
-    prompt_fr = PromptTemplate(
-        input_variables=["context", "question"],
-        template=template.strip()
-    )
-
-    final_prompt = prompt_fr.format(context=context, question=question)
+    # Substitution directe — on évite PromptTemplate qui rejette les '{' littéraux du system_prompt
+    final_prompt = (system_prompt + history_section +
+                    "\n\nCONTEXTE :\n" + context +
+                    "\n\nQuestion :\n" + question +
+                    "\n\nRéponse :")
 
     def _gen():
         try:

@@ -21,6 +21,8 @@ from config import (
     COLLECTION_NAME, NUM_CHUNKS, RRF_K,
     REWRITER_MODEL, WEIGHT_SEMANTIC, WEIGHT_BM25,
     SELF_RAG_ENABLED, NUM_CHUNKS_PARENT_CHILD,
+    CE_RELEVANCE_THRESHOLD, OUT_OF_SCOPE_MESSAGE,
+    USE_CROSS_ENCODER,
 )
 from retrieval.retrieve import hybrid_retrieve
 from core.llm_answer import answer, answer_stream, build_context, build_citation_map
@@ -198,7 +200,7 @@ def process_query(user_q: str, selected_chunks=None, system_prompt=None, source_
     entity_graph = _load_entity_graph(source_doc=source_filter)
 
     # Retrieve hybride (semantic + bm25 + GraphRAG) + RRF
-    final_chunks = hybrid_retrieve(
+    final_chunks, max_ce_score = hybrid_retrieve(
         collection=collection,
         query=query,
         bm25_tuple=bm25_tuple,
@@ -211,6 +213,11 @@ def process_query(user_q: str, selected_chunks=None, system_prompt=None, source_
         entity_graph=entity_graph,
         source_filter=source_filter
     )
+
+    # ── Détection hors-scope ──────────────────────────────────────────────────
+    if USE_CROSS_ENCODER and max_ce_score is not None and max_ce_score < CE_RELEVANCE_THRESHOLD:
+        print(f"[scope] Hors-scope détecté (max CE={max_ce_score:.3f} < {CE_RELEVANCE_THRESHOLD})")
+        return OUT_OF_SCOPE_MESSAGE, [], []
 
     if not final_chunks:
         print("\n[Resultat] Aucun chunk pertinent trouve.")
@@ -264,7 +271,7 @@ def _prepare_retrieval(user_q: str, source_filter: str = None,
     _pc_active = parent_child_on if parent_child_on is not None else True
     _topk = NUM_CHUNKS_PARENT_CHILD if _pc_active else NUM_CHUNKS
 
-    final_chunks = hybrid_retrieve(
+    final_chunks, max_ce_score = hybrid_retrieve(
         collection=collection,
         query=query,
         bm25_tuple=bm25_tuple,
@@ -278,6 +285,14 @@ def _prepare_retrieval(user_q: str, source_filter: str = None,
         source_filter=source_filter,
         parent_child_on=parent_child_on,
     )
+
+    # ── Détection hors-scope ──────────────────────────────────────────────────
+    # Si le cross-encoder a tourné et que son meilleur score est sous le seuil,
+    # aucun chunk n'est pertinent → on retourne un signal out_of_scope.
+    if USE_CROSS_ENCODER and max_ce_score is not None and max_ce_score < CE_RELEVANCE_THRESHOLD:
+        print(f"[scope] ⚠ Hors-scope détecté (max CE={max_ce_score:.3f} < {CE_RELEVANCE_THRESHOLD})")
+        return q_main, [], max_ce_score  # final_chunks vide + score pour l'appelant
+
     return q_main, final_chunks
 
 
@@ -318,12 +333,22 @@ def process_query_stream(user_q: str, system_prompt=None, source_filter: str = N
         return _replay_gen(), best_chunks, best_citations
 
     # ── Pipeline classique ────────────────────────────────────────────────────
-    q_main, final_chunks = _prepare_retrieval(
+    retrieval_result = _prepare_retrieval(
         user_q, source_filter=source_filter,
         conversation_history=conversation_history,
         parent_child_on=parent_child_on,
         rewrite_enabled=rewrite_enabled,
     )
+
+    # _prepare_retrieval retourne (q_main, chunks) ou (q_main, [], max_ce_score) si hors-scope
+    if len(retrieval_result) == 3:
+        q_main, final_chunks, max_ce_score = retrieval_result
+        # Hors-scope : on streame le message d'information
+        def _scope_gen():
+            yield OUT_OF_SCOPE_MESSAGE
+        return _scope_gen(), [], []
+
+    q_main, final_chunks = retrieval_result
 
     if not final_chunks:
         print("\n[Resultat] Aucun chunk pertinent trouve.")

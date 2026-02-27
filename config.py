@@ -103,6 +103,22 @@ MONGO_URI = "mongodb://localhost:27017"
 MONGO_DB  = "ragdb"
 #---------------------------------------------
 
+# --------------- DÉTECTION HORS-SCOPE (CE threshold) ---------------
+# Seuil sur le score max du cross-encoder (après sigmoïde, donc en [0, 1]).
+# Score "neutre" (logit=0) → 0.500 exact.
+# Si max(ce_score) < CE_RELEVANCE_THRESHOLD → aucun chunk pertinent → réponse hors-scope.
+# Calibration empirique : tester quelques questions hors-domaine et relever le max CE observé.
+#   - Questions in-scope  → max CE ≥ 0.53 en général
+#   - Questions hors-scope → max CE ≈ 0.50–0.52
+# Seuil recommandé : 0.525 (peut être ajusté via l'UI Settings)
+CE_RELEVANCE_THRESHOLD = 0.525
+# Message renvoyé à l'utilisateur quand la question est détectée hors-scope
+OUT_OF_SCOPE_MESSAGE = (
+    "Je n'ai pas trouvé d'information pertinente dans les documents indexés pour répondre à cette question. "
+    "Vérifiez que votre question concerne bien les documents chargés, ou essayez de la reformuler."
+)
+#---------------------------------------------
+
 # --------------- LLM CONTEXT WINDOW ---------------
 # Taille de la fenêtre de contexte envoyée à Ollama (en tokens).
 # Défaut Ollama sans cette option : souvent 32768 → lent + forte conso VRAM.

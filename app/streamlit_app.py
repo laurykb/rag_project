@@ -603,12 +603,15 @@ if "show_sidebar" not in st.session_state:
 
 # Self-RAG
 from config import SELF_RAG_ENABLED, SELF_RAG_THRESHOLD, SELF_RAG_MAX_RETRIES, PARENT_CHILD_ENABLED
+from config import CE_RELEVANCE_THRESHOLD
 if "self_rag_enabled" not in st.session_state:
     st.session_state.self_rag_enabled     = False  # désactivé par défaut (latence)
 if "self_rag_threshold" not in st.session_state:
     st.session_state.self_rag_threshold   = SELF_RAG_THRESHOLD
 if "self_rag_max_retries" not in st.session_state:
     st.session_state.self_rag_max_retries = SELF_RAG_MAX_RETRIES
+if "ce_relevance_threshold" not in st.session_state:
+    st.session_state.ce_relevance_threshold = CE_RELEVANCE_THRESHOLD
 
 # Parent-Child Retrieval
 if "parent_child_enabled" not in st.session_state:
@@ -1113,6 +1116,7 @@ with tab1:
                     else:
                         status_placeholder.caption("Génération en cours...")
                         full_response = ""
+                        _is_out_of_scope = False
                         try:
                             for token in token_gen:
                                 full_response += token
@@ -1124,7 +1128,13 @@ with tab1:
                         response_placeholder.markdown(full_response)
                         status_placeholder.empty()
 
-                        if citations:
+                        # Détection hors-scope : message commence par l'emoji d'avertissement
+                        if full_response.startswith("⚠️"):
+                            _is_out_of_scope = True
+                            st.session_state.final_chunks = []
+                            st.session_state.citations    = []
+
+                        if citations and not _is_out_of_scope:
                             with st.expander("Sources", expanded=False):
                                 _display_citations(citations)
 
@@ -2041,6 +2051,22 @@ with tab5:
 
     # ── Self-RAG : paramètres fins (le ON/OFF est dans la sidebar de tab1) ──
     st.markdown("---")
+    st.subheader("Détection hors-scope")
+    st.caption(
+        "Si le meilleur score du cross-encoder est inférieur à ce seuil, "
+        "le RAG répond qu'il n'a pas d'information pertinente — sans appeler le LLM de génération."
+    )
+    new_ce_relevance_threshold = st.slider(
+        "Seuil CE relevance (max score chunks)",
+        min_value=0.50, max_value=0.60,
+        value=float(st.session_state.ce_relevance_threshold),
+        step=0.005,
+        format="%.3f",
+        help="Score CE sigmoïde. Neutre = 0.500. In-scope typique ≥ 0.530. "
+             "Recommandé : 0.525. Augmenter si trop de faux positifs hors-scope.",
+    )
+
+    st.markdown("---")
     st.subheader("Self-RAG — paramètres fins")
     st.caption(
         "Le Self-RAG s'active/désactive depuis la sidebar de l'onglet SSH GPT. "
@@ -2080,11 +2106,13 @@ with tab5:
             text = re.sub(r"SELF_RAG_ENABLED\s*=\s*(True|False)", f"SELF_RAG_ENABLED = {new_self_rag_enabled}", text)
             text = re.sub(r"SELF_RAG_THRESHOLD\s*=\s*[\d.]+", f"SELF_RAG_THRESHOLD = {new_self_rag_threshold}", text)
             text = re.sub(r"SELF_RAG_MAX_RETRIES\s*=\s*\d+", f"SELF_RAG_MAX_RETRIES = {int(new_self_rag_retries)}", text)
+            text = re.sub(r"CE_RELEVANCE_THRESHOLD\s*=\s*[\d.]+", f"CE_RELEVANCE_THRESHOLD = {new_ce_relevance_threshold}", text)
             p.write_text(text)
             st.success(" config.py mis à jour. Redémarrez l'application.")
             st.session_state.num_chunks = new_num
             st.session_state.embed_model = selected_embed
             st.session_state.gen_model = selected_gen
+            st.session_state.ce_relevance_threshold = new_ce_relevance_threshold
 
             # message pour proposer le redémarrage
             st.info("Les changements ont été enregistrés. Cliquez sur 'Redémarrer l'app' ci-dessous pour appliquer les modifications.")
